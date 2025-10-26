@@ -328,7 +328,6 @@ MIT License - See LICENSE file for details
 
 ## Acknowledgments
 
-- Built as part of a Data Science & Real-Time Systems course
 - Geoapify for geolocation services
 - Streamlit for the rapid prototyping framework
 - Apache Kafka for event streaming
@@ -337,7 +336,7 @@ MIT License - See LICENSE file for details
 
 For issues, questions, or demo requests:
 - Open an issue on GitHub
-- Email: your.email@example.com
+- Email: mahlatsimm1510@gmail.com
 
 ## Deployment Notes
 
