@@ -1,9 +1,14 @@
 # app.py
+import os
 import streamlit as st
 from datetime import date
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 from auth.auth_handlers import (
     login_widget,
     logout_widget,
@@ -22,6 +27,203 @@ from auth.auth_handlers import (
 # -----------------------------------
 st.set_page_config(page_icon="🚨", page_title="Campus Safety Dashboard", layout="wide")
 st.title("🚨 Campus Safety Dashboard")
+
+# -----------------------------------
+# Configuration
+# -----------------------------------
+GEOAPIFY_API_KEY = os.environ.get("GEOAPIFY_API_KEY", "")
+OPENROUTESERVICE_API_KEY = os.environ.get("OPENROUTESERVICE_API_KEY", "")
+
+# -----------------------------------
+# Helper function to decode polyline
+# -----------------------------------
+def decode_polyline(polyline_str):
+    """
+    Decode an encoded polyline string into list of (lat, lon) coordinates
+    Based on Google's polyline encoding algorithm
+    """
+    coordinates = []
+    index = 0
+    lat = 0
+    lng = 0
+    
+    while index < len(polyline_str):
+        # Decode latitude
+        result = 0
+        shift = 0
+        while True:
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlat = ~(result >> 1) if result & 1 else result >> 1
+        lat += dlat
+        
+        # Decode longitude
+        result = 0
+        shift = 0
+        while True:
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        dlng = ~(result >> 1) if result & 1 else result >> 1
+        lng += dlng
+        
+        coordinates.append((lat / 1e5, lng / 1e5))
+    
+    return coordinates
+
+# -----------------------------------
+# Helper function to get route geometry
+# -----------------------------------
+@st.cache_data(ttl=3600)
+def get_route_geometry(start_lat, start_lon, end_lat, end_lon, debug=False):
+    """
+    Get actual road path coordinates from OpenRouteService
+    Returns list of (lat, lon) tuples representing the route
+    """
+    try:
+        # Use the correct JSON endpoint format
+        url = "https://api.openrouteservice.org/v2/directions/foot-walking/json"
+        
+        # Check if API key is set
+        if not OPENROUTESERVICE_API_KEY or OPENROUTESERVICE_API_KEY == "YOUR_OPENROUTESERVICE_API_KEY":
+            st.error("🔑 OpenRouteService API key not configured! Please add your API key to the code.")
+            return [(start_lat, start_lon), (end_lat, end_lon)]
+        
+        # OpenRouteService expects the API key without "Bearer" prefix
+        headers = {
+            'Authorization': OPENROUTESERVICE_API_KEY,
+            'Content-Type': 'application/json; charset=utf-8',
+            'Accept': 'application/json, application/geo+json, application/gpx+xml, img/png; charset=utf-8'
+        }
+        body = {
+            'coordinates': [[start_lon, start_lat], [end_lon, end_lat]]
+        }
+        
+        if debug:
+            st.write("**Debug Info:**")
+            st.write(f"- URL: {url}")
+            st.write(f"- API Key (first 20 chars): {OPENROUTESERVICE_API_KEY[:20]}...")
+            st.write(f"- Coordinates: [{start_lon}, {start_lat}] to [{end_lon}, {end_lat}]")
+        
+        # Increased timeout to 30 seconds
+        response = requests.post(url, json=body, headers=headers, timeout=30)
+        
+        if debug:
+            st.write(f"- Response Status: {response.status_code}")
+        
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Debug: Show response structure
+        if debug:
+            st.write(f"- Response type: {type(data)}")
+            st.write(f"- Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+            st.json(data)
+        
+        # Check response structure
+        if not isinstance(data, dict):
+            st.warning(f"⚠️ Unexpected response type: {type(data)}")
+            return [(start_lat, start_lon), (end_lat, end_lon)]
+        
+        if 'routes' not in data:
+            st.warning(f"⚠️ No 'routes' key in response. Keys: {list(data.keys())}")
+            return [(start_lat, start_lon), (end_lat, end_lon)]
+        
+        if len(data['routes']) == 0:
+            st.warning(f"⚠️ No routes found in response")
+            return [(start_lat, start_lon), (end_lat, end_lon)]
+        
+        # Get the first route
+        route = data['routes'][0]
+        
+        # Check if geometry exists
+        if 'geometry' not in route:
+            st.warning(f"⚠️ No 'geometry' in route. Route keys: {list(route.keys())}")
+            return [(start_lat, start_lon), (end_lat, end_lon)]
+        
+        geometry = route['geometry']
+        
+        # Handle different geometry formats (GeoJSON, encoded polyline, etc.)
+        if isinstance(geometry, str):
+            # Encoded polyline - decode it
+            if debug:
+                st.write(f"- Decoding polyline: {geometry[:50]}...")
+            coords = decode_polyline(geometry)
+            # Coordinates are already in (lat, lon) format from decoder
+            return coords
+        elif isinstance(geometry, dict) and 'coordinates' in geometry:
+            # GeoJSON format
+            coords = geometry['coordinates']
+            # Convert from [lon, lat] to [lat, lon]
+            return [(lat, lon) for lon, lat in coords]
+        elif isinstance(geometry, list):
+            # Already a list of coordinates - assume [lon, lat] format
+            return [(lat, lon) for lon, lat in geometry]
+        else:
+            st.warning(f"⚠️ Unknown geometry format: {type(geometry)}")
+            return [(start_lat, start_lon), (end_lat, end_lon)]
+        
+    except requests.exceptions.Timeout:
+        st.warning(f"⏱️ Route calculation timed out after 30 seconds. Check your internet connection or try again later.")
+        return [(start_lat, start_lon), (end_lat, end_lon)]
+    except requests.exceptions.HTTPError as e:
+        # More detailed error for HTTP errors
+        error_msg = f"⚠️ HTTP Error ({e.response.status_code}): {e.response.reason}"
+        try:
+            error_detail = e.response.json()
+            if 'error' in error_detail:
+                error_msg += f"\n\nAPI Response: {error_detail['error']}"
+        except:
+            try:
+                error_msg += f"\n\nResponse: {e.response.text[:200]}"
+            except:
+                pass
+        
+        st.warning(error_msg)
+        
+        # Additional help for 403 errors
+        if e.response.status_code == 403:
+            st.error("""
+            **🔑 API Key Issue Detected!**
+            
+            Common causes for 403 Forbidden:
+            1. ❌ Invalid API key format
+            2. ❌ API key not confirmed via email
+            3. ❌ API key doesn't have Directions API enabled
+            4. ❌ Rate limit exceeded
+            
+            **How to fix:**
+            1. Go to https://openrouteservice.org/dev/#/home
+            2. Log in to your account
+            3. Go to "Dashboard" → "Tokens" or "API Keys"
+            4. Make sure your token is active and confirmed
+            5. Copy the FULL token (the JWT token with dots and equals sign)
+            6. Replace it in the code: `OPENROUTESERVICE_API_KEY = "put_token_here"`
+            
+            The token should look like: eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjFmZTE2...
+            """)
+        
+        return [(start_lat, start_lon), (end_lat, end_lon)]
+    except requests.exceptions.RequestException as e:
+        st.warning(f"⚠️ Network error: {str(e)}")
+        return [(start_lat, start_lon), (end_lat, end_lon)]
+    except (KeyError, IndexError, TypeError) as e:
+        st.warning(f"❌ Error parsing response: {type(e).__name__} - {str(e)}")
+        st.info("💡 Enable debug mode to see the full API response structure")
+        return [(start_lat, start_lon), (end_lat, end_lon)]
+    except Exception as e:
+        st.warning(f"❌ Unexpected error: {type(e).__name__} - {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+        return [(start_lat, start_lon), (end_lat, end_lon)]
 
 # -----------------------------
 # Sidebar Authentication
@@ -82,11 +284,6 @@ if st.session_state.get("authentication_status"):
             if st.button("❌ Close", use_container_width=True):
                 st.session_state["show_forgot_username"] = False
                 st.rerun()
-
-# -----------------------------
-# Configuration
-# -----------------------------
-GEOAPIFY_API_KEY = "1c98e08d36c4499c8167b708d4b80351"
 
 # -----------------------------------
 # Only show dashboard if authenticated
@@ -186,12 +383,8 @@ if st.session_state.get("authentication_status"):
             
             # Add filter options
             with st.expander("🔍 Filter Reports"):
-                col1, col2 = st.columns(2)
-                with col1:
                     report_types = ["All"] + list(reports_df["Type"].unique())
                     selected_type = st.selectbox("Report Type", report_types)
-                with col2:
-                    days_back = st.slider("Days to show", 1, 365, 30)
             
             # Apply filters
             filtered_df = reports_df.copy()
@@ -206,10 +399,14 @@ if st.session_state.get("authentication_status"):
                 color="Type",
                 hover_name="Description",
                 hover_data={"Lat": False, "Lon": False, "Created At": True, "User": False},
-                zoom=13, 
+                zoom=13.5, 
                 height=600,
-                color_discrete_sequence=px.colors.qualitative.Set2
+                color_discrete_sequence=px.colors.qualitative.Set2,
+                size_max=20  # Controls maximum marker size
             )
+            # Update marker size
+            fig.update_traces(marker=dict(size=9))  # Set marker size (default is ~6)
+            
             fig.update_layout(
                 mapbox_style="open-street-map", 
                 mapbox_center={"lat": -28.743554, "lon": 24.762580},
@@ -219,31 +416,104 @@ if st.session_state.get("authentication_status"):
         else:
             st.info("📭 No safety reports to display yet. Be the first to report!")
 
+
     elif selected_map == "Safe Routes":
         if not routes_df.empty:
             st.info(f"Showing {len(routes_df)} safe routes on campus")
             
-            route_points = pd.concat([
-                routes_df.rename(columns={"Start Lat": "Lat", "Start Lon": "Lon"})[["Route ID", "Lat", "Lon"]],
-                routes_df.rename(columns={"End Lat": "Lat", "End Lon": "Lon"})[["Route ID", "Lat", "Lon"]]
-            ])
-            
-            fig = px.line_mapbox(
-                route_points, 
-                lat="Lat", 
-                lon="Lon", 
-                color="Route ID",
-                line_group="Route ID", 
-                hover_name="Route ID",
-                zoom=12, 
-                height=600
-            )
-            fig.update_layout(
-                mapbox_style="open-street-map", 
-                mapbox_center={"lat": -28.743554, "lon": 24.762580},
-                margin={"r": 0, "t": 0, "l": 0, "b": 0}
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            # Show loading message while fetching routes
+            with st.spinner("🗺️ Calculating routes along roads..."):
+                # Create base map
+                fig = go.Figure()
+                
+                # Color palette for different routes
+                colors = px.colors.qualitative.Set2
+                
+                # Process each route
+                for idx, row in routes_df.iterrows():
+                    route_id = row["Route ID"]
+                    start_lat = row["Start Lat"]
+                    start_lon = row["Start Lon"]
+                    end_lat = row["End Lat"]
+                    end_lon = row["End Lon"]
+                    
+                    # Get route geometry from OpenRouteService
+                    route_coords = get_route_geometry(start_lat, start_lon, end_lat, end_lon, debug=False)
+                    
+                    # Extract lats and lons
+                    lats = [coord[0] for coord in route_coords]
+                    lons = [coord[1] for coord in route_coords]
+                    
+                    # Add route line
+                    color = "green"
+                    fig.add_trace(go.Scattermapbox(
+                        lat=lats,
+                        lon=lons,
+                        mode='lines',
+                        line=dict(width=4, color=color),
+                        name=f"Route {route_id}",
+                        hovertemplate=f"<b>Route {route_id}</b><br>" +
+                                    "Lat: %{lat:.6f}<br>" +
+                                    "Lon: %{lon:.6f}<br>" +
+                                    "<extra></extra>"
+                    ))
+                    
+                    # # Add start marker
+                    # fig.add_trace(go.Scattermapbox(
+                    #     lat=[start_lat],
+                    #     lon=[start_lon],
+                    #     mode='markers',
+                    #     marker=dict(size=12, color='green', symbol='circle'),
+                    #     name=f"Start {route_id}",
+                    #     hovertemplate=f"<b>Route {route_id} - Start</b><br>" +
+                    #                 f"Lat: {start_lat:.6f}<br>" +
+                    #                 f"Lon: {start_lon:.6f}<br>" +
+                    #                 "<extra></extra>",
+                    #     showlegend=False
+                    # ))
+                    
+                    # # Add end marker
+                    # fig.add_trace(go.Scattermapbox(
+                    #     lat=[end_lat],
+                    #     lon=[end_lon],
+                    #     mode='markers',
+                    #     marker=dict(size=12, color='green', symbol='circle'),
+                    #     name=f"End {route_id}",
+                    #     hovertemplate=f"<b>Route {route_id} - End</b><br>" +
+                    #                 f"Lat: {end_lat:.6f}<br>" +
+                    #                 f"Lon: {end_lon:.6f}<br>" +
+                    #                 "<extra></extra>",
+                    #     showlegend=False
+                    # ))
+                
+                # Update layout
+                fig.update_layout(
+                    mapbox=dict(
+                        style="open-street-map",
+                        center=dict(lat=-28.743554, lon=24.762580),
+                        zoom=15
+                    ),
+                    height=600,
+                    margin={"r": 0, "t": 0, "l": 0, "b": 0},
+                    showlegend=True,
+                    legend=dict(
+                        yanchor="top",
+                        y=0.99,
+                        xanchor="left",
+                        x=0.01,
+                        bgcolor="rgba(255, 255, 255, 0.8)"
+                    )
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+            # Show route information
+            with st.expander("📊 Route Details"):
+                st.dataframe(
+                    routes_df[["Route ID", "Start Lat", "Start Lon", "End Lat", "End Lon"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
         else:
             st.info("🛣️ No safe routes available yet.")
 
@@ -265,7 +535,7 @@ if st.session_state.get("authentication_status"):
             )
             fig.update_layout(
                 mapbox_style="open-street-map", 
-                mapbox_center={"lat": -28.743554, "lon": 24.762580},
+                mapbox_center={"lat": -28.750216, "lon": 24.759346},
                 margin={"r": 0, "t": 0, "l": 0, "b": 0}
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -525,3 +795,5 @@ else:
         6. **📞 Save Emergency Numbers** - Quick access is crucial
         7. **🗣️ Report Suspicious Activity** - Help keep everyone safe
         """)
+
+st.caption("🚨 Campus Safety Dashboard | This platform refreshes every 10 minutes")
